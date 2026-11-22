@@ -1,5 +1,6 @@
 import regex as re
 import unicodedata
+from collections import Counter
 
 SPLIT_PATTERN = r"""[^\r\n\p{L}\p{N}]?+\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]++[\r\n]*|\s*[\r\n]|\s+(?!\S)|\s+"""
 
@@ -9,28 +10,34 @@ class BPETokenizer:
         self.pattern = re.compile(SPLIT_PATTERN)
         self.merges = {}
         self.special_tokens = {}
+        self.special_pattern = None
+        self.inverse_special = {}
         self.vocab = self._build_vocab()
+        self.cache = {}
+        self.cache_max = 1_000_000
 
     def train(self, text, vocab_size, verbose=False) -> None:
         assert vocab_size >= 256
         num_merges = vocab_size - 256
 
-        chunks = re.findall(self.pattern, text)
-        ids_lists = [list(chunk.encode("utf-8")) for chunk in chunks]
+        chunks = Counter(re.findall(self.pattern, text))
+        ids_lists = [
+            (list(chunk.encode("utf-8")), freq) for chunk, freq in chunks.items()
+        ]
 
         merges = {}
         vocab = {idx: bytes([idx]) for idx in range(256)}
         for i in range(num_merges):
             stats = {}
-            for ids in ids_lists:
-                self._get_stats(ids, stats)
+            for ids, freq in ids_lists:
+                self._get_stats(ids, freq, stats)
             if not stats:
                 break
             pair = max(stats, key=stats.__getitem__)
             if stats[pair] < 2:
                 break
             idx = 256 + i
-            ids_lists = [self._merge(ids, pair, idx) for ids in ids_lists]
+            ids_lists = [(self._merge(ids, pair, idx), freq) for ids, freq in ids_lists]
             merges[pair] = idx
             vocab[idx] = vocab[pair[0]] + vocab[pair[1]]
             if verbose:
@@ -39,7 +46,10 @@ class BPETokenizer:
                 )
 
         self.merges = merges
-        self.vocab = vocab
+        self.vocab = self._build_vocab()
+        if self.special_tokens:
+            self.register_special_tokens(list(self.special_tokens))
+        self.cache.clear()
 
     def _encode_chunk(self, text_bytes):
         ids = list(text_bytes)
@@ -52,16 +62,51 @@ class BPETokenizer:
             ids = self._merge(ids, pair, idx)
         return ids
 
-    def encode(self, text):
+    def encode_ordinary(self, text):
         ids = []
         for chunk in re.findall(self.pattern, text):
-            ids.extend(self._encode_chunk(chunk.encode("utf-8")))
+            chunk_ids = self.cache.get(chunk)
+            if chunk_ids is None:
+                chunk_ids = self._encode_chunk(chunk.encode("utf-8"))
+                if len(self.cache) >= self.cache_max:
+                    self.cache.clear()
+                self.cache[chunk] = chunk_ids
+            ids.extend(chunk_ids)
         return ids
 
     def decode(self, ids):
         text_bytes = b"".join(self.vocab[idx] for idx in ids)
         text = text_bytes.decode("utf-8", errors="replace")
         return text
+
+    def encode(self, text, allowed_special="none"):
+        if allowed_special == "none" or not self.special_tokens:
+            return self.encode_ordinary(text)
+        if allowed_special == "all":
+            allowed = set(self.special_tokens)
+        else:
+            allowed = set(allowed_special)  # e.g.: {"<|endoftext|>"}
+
+        ids = []
+        for part in self.special_pattern.split(text):
+            if part in allowed:
+                ids.append(self.special_tokens[part])
+            elif part:
+                ids.extend(self.encode_ordinary(part))
+        return ids
+
+    def register_special_tokens(self, tokens):
+        start = 256 + len(self.merges)
+        self.special_tokens = {tok: start + i for i, tok in enumerate(tokens)}
+        self.inverse_special = {i: tok for tok, i in self.special_tokens.items()}
+        self.vocab = self._build_vocab()
+        if self.special_tokens:
+            alts = sorted(self.special_tokens, key=len, reverse=True)
+            self.special_pattern = re.compile(
+                "(" + "|".join(re.escape(t) for t in alts) + ")"
+            )
+        else:
+            self.special_pattern = None
 
     def _build_vocab(self):
         vocab = {idx: bytes([idx]) for idx in range(256)}
@@ -72,10 +117,10 @@ class BPETokenizer:
         return vocab
 
     @staticmethod
-    def _get_stats(ids, counts=None):
+    def _get_stats(ids, freq=1, counts=None):
         counts = {} if counts is None else counts
         for pair in zip(ids, ids[1:]):
-            counts[pair] = counts.get(pair, 0) + 1
+            counts[pair] = counts.get(pair, 0) + freq
         return counts
 
     @staticmethod
@@ -106,16 +151,23 @@ class BPETokenizer:
         return "".join(chars)
 
     def save(self, prefix):
-        model_file = prefix + ".model"
-        with open(model_file, "w", encoding="utf-8") as f:
-            f.write("myownllm bpe v2\n")
+        for tok in self.special_tokens:
+            assert "\n" not in tok, f"Special token with line break: {tok!r}"
+        assert "\n" not in self.pattern.pattern
+        for k, (pair, idx) in enumerate(self.merges.items()):
+            assert idx == 256 + k, f"Merges out of order: {pair} -> {idx}"
+
+        with open(prefix + ".model", "w", encoding="utf-8") as f:
+            f.write("myownllm bpe v3\n")
             f.write(f"{self.pattern.pattern}\n")
+            f.write(f"{len(self.special_tokens)}\n")
+            for tok, idx in self.special_tokens.items():
+                f.write(f"{idx} {tok}\n")
             for pair in self.merges:
                 f.write(f"{pair[0]} {pair[1]}\n")
 
-        vocab_file = prefix + ".vocab"
         inverted_merges = {idx: pair for pair, idx in self.merges.items()}
-        with open(vocab_file, "w", encoding="utf-8") as f:
+        with open(prefix + ".vocab", "w", encoding="utf-8") as f:
             for idx, token in self.vocab.items():
                 s = self._render_token(token)
 
@@ -129,19 +181,38 @@ class BPETokenizer:
 
     def load(self, path):
         assert path.endswith(".model")
-        merges = {}
-        idx = 256
+
         with open(path, encoding="utf-8") as f:
-            version = f.readline().strip()
-            if version != "myownllm bpe v2":
+            version = f.readline().rstrip("\n")
+            if version != "myownllm bpe v3":
                 raise ValueError(f"Version not found: {version!r}")
+
             pattern = f.readline().rstrip("\n")
+
+            specials = []
+            n_special = int(f.readline())
+            for _ in range(n_special):
+                id_str, tok = f.readline().rstrip("\n").split(" ", 1)
+                specials.append((tok, int(id_str)))
+
+            merges = {}
+            idx = 256
             for line in f:
                 if not line.strip():
                     continue
                 idx1, idx2 = map(int, line.split())
                 merges[(idx1, idx2)] = idx
                 idx += 1
+
         self.pattern = re.compile(pattern)
         self.merges = merges
-        self.vocab = self._build_vocab()
+        self.special_tokens = {}
+        self.register_special_tokens([tok for tok, _ in specials])
+
+        for tok, file_id in specials:
+            if self.special_tokens[tok] != file_id:
+                raise ValueError(
+                    f"Inconsistent id for {tok!r}: file={file_id}, "
+                    f"expected={self.special_tokens[tok]}"
+                )
+        self.cache.clear()
