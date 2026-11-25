@@ -1,10 +1,23 @@
 [project]
 name = "myownllm"
 version = "0.1.0"
-description = "Add your description here"
+description = "A portuguese small language model"
 readme = "README.md"
-requires-python = ">=3.12"
+requires-python = ">=3.12,<3.13"
 dependencies = [
-    "datasets>=5.2.0",
-    "regex>=2026.11.19",
+    "torch",
+    "regex",
 ]
+
+[dependency-groups]
+data = ["datasets"]
+eval-tokenizer = ["tiktoken", "transformers"]
+dev = ["pytest"]
+
+[tool.uv.sources]
+torch = [{ index = "pytorch-cu126"}]
+
+[[tool.uv.index]]
+name = "pytorch-cu126"
+url = "https://download.pytorch.org/whl/cu126"
+explicit = true
